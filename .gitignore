@@ -1,0 +1,38 @@
+# 构建产物
+bin/
+obj/
+dist/
+publish/
+artifacts/
+
+# 本地包/工具/缓存
+.nuget-packages/
+.tools/
+.cache/
+
+# 本地探测与临时目录
+.probe-*/
+.dsh-*
+
+# 本机 NuGet 配置（使用内网源，不入库）
+NuGet.Config
+
+# 调研资料（不随应用发布）
+research/
+
+# 团队协作状态
+.agent-teams/
+
+# IDE / 用户配置
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.DotSettings.user
+
+# 日志与系统文件
+logs/
+*.log
+Thumbs.db
+.DS_Store
