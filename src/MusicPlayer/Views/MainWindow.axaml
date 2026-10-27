@@ -1,0 +1,21 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="MusicPlayer.Views.MainWindow"
+        Title="MusicPlayer"
+        Width="1000" Height="680"
+        MinWidth="640" MinHeight="420"
+        WindowStartupLocation="CenterScreen"
+        Opened="OnOpened">
+
+    <!-- 空白首页：后续界面内容都放在这个 Grid 里 -->
+    <Grid>
+        <!-- 右下角版本号，发布后可用于肉眼核对自动更新是否生效 -->
+        <TextBlock x:Name="VersionText"
+                   Text="v1.0.0"
+                   HorizontalAlignment="Right"
+                   VerticalAlignment="Bottom"
+                   Margin="0,0,12,8"
+                   FontSize="11"
+                   Opacity="0.5" />
+    </Grid>
+</Window>
