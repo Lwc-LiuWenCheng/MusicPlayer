@@ -1,0 +1,247 @@
+name: Release
+
+# 发布 Windows x64 自包含包 + NetSparkle appcast.xml，并创建/更新 GitHub Release。
+# 触发方式：
+#   1) Actions → Release → Run workflow，输入 SemVer 版本号（例如 1.0.0，不带 v 前缀）
+#   2) 推送 v* 标签（例如 v1.0.0）
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（SemVer，不带 v 前缀，例如 1.0.0）'
+        required: true
+        default: '1.0.0'
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+# 创建 Release / 上传资产需要写权限
+permissions:
+  contents: write
+
+# 同一个 ref 的发布串行执行，避免并发写同一个 Release
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  # Avalonia 遥测在受限环境下会写用户目录失败，统一关闭
+  AVALONIA_TELEMETRY_OPTOUT: '1'
+  PROJECT_PATH: src/MusicPlayer/MusicPlayer.csproj
+
+jobs:
+  release:
+    name: Build and publish Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve version and artifact names
+        id: version
+        shell: pwsh
+        run: |
+          $eventName = '${{ github.event_name }}'
+          if ($eventName -eq 'workflow_dispatch') {
+              $raw = '${{ inputs.version }}'
+          } else {
+              # push tag 触发时 ref_name 形如 v1.0.0
+              $raw = '${{ github.ref_name }}'
+          }
+          $raw = "$raw".Trim()
+
+          # 允许带 v 前缀（tag 场景），统一成裸 SemVer 用于程序集版本与文件名
+          $version = $raw
+          if ($version.StartsWith('v') -or $version.StartsWith('V')) {
+              $version = $version.Substring(1)
+          }
+
+          if ([string]::IsNullOrWhiteSpace($version)) {
+              throw '版本号为空：workflow_dispatch 需要传入 version（例如 1.0.0），tag 触发需要形如 v1.0.0'
+          }
+          if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$') {
+              throw "版本号格式非法：'$raw'（期望 SemVer，例如 1.0.0 或 v1.0.0）"
+          }
+
+          $tag = "v$version"
+          $zipName = "MusicPlayer-win-x64-$version.zip"
+          # GITHUB_REPOSITORY 由 Actions 自动注入，形如 owner/repo
+          $repoSlug = $env:GITHUB_REPOSITORY
+          if ([string]::IsNullOrWhiteSpace($repoSlug)) { throw 'GITHUB_REPOSITORY 为空，无法拼出下载地址' }
+          $baseUrl = "https://github.com/$repoSlug/releases/download/$tag/"
+
+          "VERSION=$version" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+          "TAG=$tag" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+          "ZIP_NAME=$zipName" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+          "APPCAST_BASE_URL=$baseUrl" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+
+          "version=$version" | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
+          "tag=$tag" | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
+
+          Write-Host "版本: $version"
+          Write-Host "tag: $tag"
+          Write-Host "资产: $zipName, appcast.xml"
+          Write-Host "下载基地址: $baseUrl"
+
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore $env:PROJECT_PATH
+          if ($LASTEXITCODE -ne 0) { throw "dotnet restore 失败（exit $LASTEXITCODE）" }
+
+      - name: Publish win-x64 self-contained
+        shell: pwsh
+        run: |
+          # 版本号同时进入程序集（AssemblyVersion/FileVersion/InformationalVersion）与后续 zip 文件名
+          dotnet publish $env:PROJECT_PATH -c Release -r win-x64 --self-contained true -p:Version=$env:VERSION -o dist/app
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish 失败（exit $LASTEXITCODE）" }
+          if (-not (Test-Path 'dist/app/MusicPlayer.exe')) { throw '发布输出缺少 MusicPlayer.exe' }
+
+      - name: Package flat zip
+        shell: pwsh
+        run: |
+          $appDir = 'dist/app'
+          $zipPath = Join-Path 'dist' $env:ZIP_NAME
+
+          # 运行期产物不入包：应用运行会在安装目录生成 logs/ 与 update-state.json
+          Remove-Item (Join-Path $appDir 'logs') -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $appDir 'update-state.json') -Force -ErrorAction SilentlyContinue
+          Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+
+          # 用 dist/app/* 通配符打包：zip 根目录直接是 MusicPlayer.exe 等文件，不再套一层目录
+          # （更新安装脚本用 tar -xf 解压到安装目录，多一层目录会导致文件层级错误）
+          $sourceItems = @(Get-ChildItem -LiteralPath $appDir -Force)
+          if ($sourceItems.Count -eq 0) { throw "发布输出目录为空：$appDir" }
+          Compress-Archive -Path (Join-Path $appDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
+          if (-not (Test-Path $zipPath)) { throw "打包失败，未生成 $zipPath" }
+
+          # 校验扁平结构：解压到临时目录，根目录必须直接包含 MusicPlayer.exe，且条目数与发布输出一致
+          $checkDir = 'dist/_zipcheck'
+          Remove-Item $checkDir -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path $zipPath -DestinationPath $checkDir
+          $topItems = @(Get-ChildItem -LiteralPath $checkDir -Force)
+          if (-not (Test-Path (Join-Path $checkDir 'MusicPlayer.exe'))) {
+              throw "zip 根目录缺少 MusicPlayer.exe（打包层级错误）：$($topItems.Name -join ', ')"
+          }
+          if ($topItems.Count -ne $sourceItems.Count) {
+              throw "zip 顶层条目数 $($topItems.Count) 与发布输出 $($sourceItems.Count) 不一致"
+          }
+          if ((Test-Path (Join-Path $checkDir 'logs')) -or (Test-Path (Join-Path $checkDir 'update-state.json'))) {
+              throw 'zip 里混入了运行期产物（logs/ 或 update-state.json）'
+          }
+          Write-Host "zip 校验通过：顶层条目 $($topItems.Count) 个，MusicPlayer.exe 位于 zip 根目录"
+          Remove-Item $checkDir -Recurse -Force
+
+          Write-Host "zip 路径: $(Resolve-Path $zipPath)（$([math]::Round((Get-Item $zipPath).Length / 1MB, 1)) MB）"
+
+      - name: Install NetSparkle appcast generator
+        shell: pwsh
+        run: |
+          # 2.9.0 支持 --single-file / --file-version / --human-readable
+          # --allow-roll-forward：工具面向较旧的 .NET Desktop 运行时，允许在 runner 上的新运行时上运行
+          if (-not (Get-Command netsparkle-generate-appcast -ErrorAction SilentlyContinue)) {
+              dotnet tool install --global NetSparkleUpdater.Tools.AppCastGenerator --version 2.9.0 --allow-roll-forward
+              if ($LASTEXITCODE -ne 0) { throw "安装 NetSparkleUpdater.Tools.AppCastGenerator 失败（exit $LASTEXITCODE）" }
+          }
+          if (-not (Get-Command netsparkle-generate-appcast -ErrorAction SilentlyContinue)) {
+              throw '找不到 netsparkle-generate-appcast 命令'
+          }
+
+      - name: Ensure Ed25519 signing keys exist
+        shell: pwsh
+        run: |
+          # appcast 生成工具默认用 Ed25519 私钥给清单/安装包签名；密钥不存在时生成签名会失败。
+          # 应用当前使用 SecurityMode.Unsafe（不校验签名），这里的密钥仅用于让工具正常产出 appcast.xml。
+          # 幂等：密钥已存在时不覆盖，直接返回。
+          netsparkle-generate-appcast --generate-keys
+          if ($LASTEXITCODE -ne 0) { throw "生成 Ed25519 密钥失败（exit $LASTEXITCODE）" }
+
+      - name: Generate appcast.xml
+        shell: pwsh
+        run: |
+          $zipPath = Join-Path 'dist' $env:ZIP_NAME
+          netsparkle-generate-appcast --single-file $zipPath --file-version $env:VERSION --os windows -n MusicPlayer -u $env:APPCAST_BASE_URL -a dist --human-readable
+          if ($LASTEXITCODE -ne 0) { throw "生成 appcast.xml 失败（exit $LASTEXITCODE）" }
+          if (-not (Test-Path 'dist/appcast.xml')) { throw '未生成 dist/appcast.xml' }
+
+      - name: Verify appcast.xml
+        shell: pwsh
+        run: |
+          $raw = Get-Content 'dist/appcast.xml' -Raw
+          [xml]$xml = $raw
+
+          $enclosure = $xml.SelectSingleNode("//*[local-name()='enclosure']")
+          if (-not $enclosure) { throw 'appcast.xml 缺少 <enclosure> 节点' }
+
+          $expectedUrl = "$env:APPCAST_BASE_URL$env:ZIP_NAME"
+          $actualUrl = "$($enclosure.url)".Trim()
+          if ($actualUrl -ne $expectedUrl) {
+              throw "appcast enclosure url 不符合预期：'$actualUrl'，期望 '$expectedUrl'"
+          }
+          if ($actualUrl -match '(?<!:)//') {
+              throw "appcast enclosure url 含重复斜杠（GitHub 会 404）：$actualUrl"
+          }
+          if ($raw -notmatch ('sparkle:version\s*=\s*"' + [regex]::Escape($env:VERSION) + '"')) {
+              throw "appcast.xml 未包含 sparkle:version=`"$($env:VERSION)`""
+          }
+
+          Write-Host "appcast 校验通过：sparkle:version=$($env:VERSION)，enclosure url=$actualUrl"
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # gh 在 Release/标签不存在时会写 stderr；不同 PowerShell 版本对该开关默认值不同，这里显式关闭
+          $PSNativeCommandUseErrorActionPreference = $false
+          $repo = $env:GITHUB_REPOSITORY
+          $tag = $env:TAG
+          $assets = @((Join-Path 'dist' $env:ZIP_NAME), 'dist/appcast.xml')
+          $notes = (@(
+              "MusicPlayer $tag",
+              "",
+              "Windows x64 自包含版本（.NET 10 + Avalonia）。解压后运行 MusicPlayer.exe。",
+              "安装目录需当前用户可写（不要放在 Program Files 等需要管理员权限的位置），应用启动时会自动检查更新。",
+              "",
+              "资产：",
+              "- $($env:ZIP_NAME)：扁平更新包，zip 根目录即 MusicPlayer.exe",
+              "- appcast.xml：NetSparkle 更新清单"
+          ) -join "`n")
+
+          # 幂等：重复运行同一版本时，覆盖上传资产而不是直接失败
+          gh release view $tag --repo $repo --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "Release $tag 已存在，覆盖上传资产"
+              gh release upload $tag @assets --repo $repo --clobber
+              if ($LASTEXITCODE -ne 0) { throw "gh release upload 失败（exit $LASTEXITCODE）" }
+          } else {
+              # workflow_dispatch 触发时指定目标分支；tag 触发时标签已存在，不能再传 --target
+              $targetArgs = @()
+              if ($env:GITHUB_REF_TYPE -ne 'tag') {
+                  $targetArgs = @('--target', $env:GITHUB_REF_NAME)
+              }
+              gh release create $tag @assets --repo $repo --title "MusicPlayer $tag" --notes $notes @targetArgs
+              if ($LASTEXITCODE -ne 0) { throw "gh release create 失败（exit $LASTEXITCODE）" }
+          }
+
+          # 断言 release 同时包含 zip 与 appcast.xml
+          $assetNames = @(gh release view $tag --repo $repo --json assets --jq '.assets[].name')
+          if ($LASTEXITCODE -ne 0) { throw "读取 Release 资产列表失败（exit $LASTEXITCODE）" }
+          foreach ($expected in @($env:ZIP_NAME, 'appcast.xml')) {
+              if ($assetNames -notcontains $expected) {
+                  throw "Release 资产缺失：$expected（现有：$($assetNames -join ', ')）"
+              }
+          }
+          Write-Host "Release 资产: $($assetNames -join ', ')"
+
+          $releaseUrl = gh release view $tag --repo $repo --json url --jq .url
+          Write-Host "Release: $releaseUrl"
